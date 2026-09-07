@@ -760,7 +760,7 @@ export async function startServer(): Promise<StartedServer> {
   // company whose board receives the alert — an explicit override, else the
   // oldest active company (the instance's primary board). No company (or backups
   // disabled) leaves the board channel off; the marker + structured log still fire.
-  const databaseBackupAlertCompanyId = config.databaseBackupEnabled
+  const databaseBackupAlertCompanyId: string | null = config.databaseBackupEnabled
     ? (process.env.PAPERCLIP_DB_BACKUP_ALERT_COMPANY_ID?.trim() ||
         (await db
           .select({ id: companies.id })
@@ -768,7 +768,8 @@ export async function startServer(): Promise<StartedServer> {
           .where(eq(companies.status, "active"))
           .orderBy(asc(companies.createdAt), asc(companies.id))
           .limit(1)
-          .then((rows) => rows[0]?.id ?? null)))
+          .then((rows) => rows[0]?.id ?? null))) ??
+      null
     : null;
   const databaseBackupAlertReporter = createDatabaseBackupAlertReporter({
     markerFile: databaseBackupAlertFile,
