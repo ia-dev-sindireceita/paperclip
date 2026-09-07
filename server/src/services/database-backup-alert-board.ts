@@ -42,6 +42,14 @@ export function createDatabaseBackupAlertBoard(
     },
 
     async createAlert(companyId, input) {
+      // `allowDuplicate: false` — NOT a static idempotencyKey. The idempotency
+      // key dedup in `issueService.create` matches on (company, key) regardless
+      // of status and retains the key for 7 days, so a key from a resolved
+      // (`done`) alert would shadow a genuine second incident and report
+      // `created` with no open board issue — the exact OWASP A09 gap SIN-70819
+      // closes. `allowDuplicate: false` instead takes an advisory lock and
+      // dedups only against a NON-terminal recent-open-title issue, which guards
+      // the create-race without shadowing a resolved alert.
       const created = await svc.create(companyId, {
         title: input.title,
         description: input.description,
@@ -50,7 +58,7 @@ export function createDatabaseBackupAlertBoard(
         originKind: DATABASE_BACKUP_ALERT_ORIGIN_KIND,
         originId: companyId,
         originFingerprint: input.fingerprint,
-        idempotencyKey: input.idempotencyKey,
+        allowDuplicate: false,
         assigneeAgentId: opts.assigneeAgentId ?? undefined,
       });
       return {

@@ -38,6 +38,22 @@ function createFakeBoard(options: { failCreate?: boolean } = {}) {
     },
     async createAlert(_companyId, input) {
       if (options.failCreate) throw new Error("board create failed");
+      // Model the create-path dedup we keep: `allowDuplicate: false` in the
+      // concrete adapter dedups ONLY against a NON-terminal recent-open-title
+      // issue (the create-race guard). Crucially it must NOT be shadowed by a
+      // resolved (`done`/`cancelled`) issue — that status-agnostic shadowing is
+      // exactly the retained-idempotency-key bug this change removes. A `done`
+      // alert therefore does not block a fresh create.
+      const openSameTitle = records.find(
+        (r) => r.title === input.title && r.status !== "done" && r.status !== "cancelled",
+      );
+      if (openSameTitle) {
+        return {
+          id: openSameTitle.id,
+          identifier: openSameTitle.identifier,
+          status: openSameTitle.status,
+        };
+      }
       counter += 1;
       const rec: FakeIssue = {
         id: `issue-${counter}`,
@@ -155,6 +171,44 @@ describe("raiseDatabaseBackupAlert (idempotency / dedup)", () => {
     expect(second.action).toBe("updated");
     expect(records).toHaveLength(1);
     expect(records[0]!.comments).toEqual(["cycle 2"]);
+  });
+
+  it("creates a NEW open alert for a second incident after the first was resolved (no shadow by a done issue)", async () => {
+    // Regression for SIN-70819: a resolved (`done`) alert must not be reused for
+    // a later incident. Previously a static idempotencyKey survived resolution
+    // (7-day retention) and dedup-hit the closed issue, so a genuine second
+    // failure reported `created` with NO open board alert — the exact A09 gap.
+    const { board, records } = createFakeBoard();
+    const first = await raiseDatabaseBackupAlert(board, {
+      companyId: "c1",
+      fingerprint: DATABASE_BACKUP_ALERT_FINGERPRINT,
+      title: "Control-plane database backup is failing",
+      description: "d",
+      updateComment: "incident 1",
+    });
+    expect(first.action).toBe("created");
+
+    // Backup recovers → the open alert is resolved to done.
+    await resolveDatabaseBackupAlert(board, {
+      companyId: "c1",
+      fingerprint: DATABASE_BACKUP_ALERT_FINGERPRINT,
+      comment: "fixed",
+    });
+    expect(records[0]!.status).toBe("done");
+
+    // It fails again within the old 7-day idempotency-retention window.
+    const second = await raiseDatabaseBackupAlert(board, {
+      companyId: "c1",
+      fingerprint: DATABASE_BACKUP_ALERT_FINGERPRINT,
+      title: "Control-plane database backup is failing",
+      description: "d",
+      updateComment: "incident 2",
+    });
+    // A brand-new OPEN alert, not the resolved one.
+    expect(second.action).toBe("created");
+    expect(second.issueId).not.toBe(first.issueId);
+    expect(records).toHaveLength(2);
+    expect(records[1]!.status).toBe("todo");
   });
 
   it("leaves an open issue untouched when no updateComment is supplied (no comment storm)", async () => {
@@ -327,6 +381,35 @@ describe("createDatabaseBackupAlertReporter (defense-in-depth)", () => {
     await reporter.reportSuccess();
     expect(existsSync(markerFile)).toBe(false);
     expect(records[0]!.status).toBe("done");
+  });
+
+  it("reportFailure → reportSuccess → reportFailure raises a fresh open alert for the second incident", async () => {
+    // End-to-end (marker + board channels) regression for SIN-70819: backup
+    // flapping (fail → recover → fail) must produce a NEW open board alert on
+    // the second failure, never silently reuse the resolved one.
+    const { board, records } = createFakeBoard();
+    const reporter = createDatabaseBackupAlertReporter({
+      markerFile,
+      clearMarkerFiles: [markerFile],
+      board,
+      companyId: "c1",
+      now: () => FIXED_NOW,
+    });
+
+    await reporter.reportFailure("pg_dump: error: server version mismatch");
+    expect(records).toHaveLength(1);
+    expect(records[0]!.status).toBe("todo");
+
+    await reporter.reportSuccess();
+    expect(existsSync(markerFile)).toBe(false);
+    expect(records[0]!.status).toBe("done");
+
+    await reporter.reportFailure("pg_dump: error: server version mismatch (again)");
+    // A second OPEN alert exists — the resolved one was not reused.
+    expect(records).toHaveLength(2);
+    expect(records[1]!.status).toBe("todo");
+    expect(records[1]!.description).toContain("server version mismatch");
+    expect(existsSync(markerFile)).toBe(true);
   });
 
   it("reportHealthWarnings creates one issue for a warning status and never duplicates on repeat ticks", async () => {

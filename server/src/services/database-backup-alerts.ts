@@ -39,13 +39,21 @@ export type DatabaseBackupAlertBoard = {
     companyId: string,
     fingerprint: string,
   ): Promise<DatabaseBackupAlertIssueRef | null>;
+  /**
+   * Create the alert issue. The create MUST be status-aware: it may only
+   * deduplicate against a NON-terminal issue (the create-race guard). It must
+   * NOT be shadowed by a resolved (`done`/`cancelled`) issue — otherwise a
+   * second incident after a resolution would silently report `created` while no
+   * open alert exists on the board (the SIN-70819 A09 gap). The concrete adapter
+   * satisfies this with `allowDuplicate: false` (advisory-lock + non-terminal
+   * recent-open-title dedup), NOT with a static idempotency key.
+   */
   createAlert(
     companyId: string,
     input: {
       title: string;
       description: string;
       fingerprint: string;
-      idempotencyKey: string;
     },
   ): Promise<DatabaseBackupAlertIssueRef>;
   commentAlert(issueId: string, body: string): Promise<void>;
@@ -176,11 +184,16 @@ export async function raiseDatabaseBackupAlert(
     }
     return { action: "exists", issueId: open.id };
   }
+  // `findOpenAlert` above (origin fingerprint, non-terminal) is the primary,
+  // status-aware dedup. The create itself is guarded status-awarely by the
+  // concrete adapter (`allowDuplicate: false`) so a resolved alert can never
+  // shadow a fresh incident. Deliberately NO static idempotency key here: a
+  // retained key survives the alert being resolved to `done` and would make a
+  // second incident dedup-hit the old closed issue (SIN-70819 A09 regression).
   const created = await board.createAlert(input.companyId, {
     title: input.title,
     description: input.description,
     fingerprint: input.fingerprint,
-    idempotencyKey: `db-backup-failure:${input.companyId}`,
   });
   return { action: "created", issueId: created.id };
 }
