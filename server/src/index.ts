@@ -89,7 +89,11 @@ import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import { inspectDatabaseBackupHealth } from "./services/database-backup-health.js";
 import { createDatabaseBackupAlertReporter } from "./services/database-backup-alerts.js";
-import { createDatabaseBackupAlertBoard } from "./services/database-backup-alert-board.js";
+// NOTE: database-backup-alert-board pulls in the issues service (and its
+// transitive `heartbeatRuns` drizzle table access via successful-run-handoff-state).
+// It is loaded lazily at boot only when board alerting is actually enabled, so
+// importing this entrypoint (e.g. in startServer tests that mock @paperclipai/db
+// without every table export) never evaluates that heavy graph.
 import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
@@ -771,13 +775,17 @@ export async function startServer(): Promise<StartedServer> {
           .then((rows) => rows[0]?.id ?? null))) ??
       null
     : null;
+  const databaseBackupAlertBoard =
+    config.databaseBackupEnabled && databaseBackupAlertCompanyId
+      ? (await import("./services/database-backup-alert-board.js")).createDatabaseBackupAlertBoard(
+          db,
+          { priority: "high" },
+        )
+      : null;
   const databaseBackupAlertReporter = createDatabaseBackupAlertReporter({
     markerFile: databaseBackupAlertFile,
     clearMarkerFiles: databaseBackupAlertFiles,
-    board:
-      config.databaseBackupEnabled && databaseBackupAlertCompanyId
-        ? createDatabaseBackupAlertBoard(db, { priority: "high" })
-        : null,
+    board: databaseBackupAlertBoard,
     companyId: databaseBackupAlertCompanyId,
     logger,
   });
