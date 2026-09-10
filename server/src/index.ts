@@ -89,6 +89,7 @@ import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import { inspectDatabaseBackupHealth } from "./services/database-backup-health.js";
 import { createDatabaseBackupAlertReporter } from "./services/database-backup-alerts.js";
+import { createPgClientVersionPreflightReporter } from "./services/pgclient-version-preflight.js";
 // NOTE: database-backup-alert-board pulls in the issues service (and its
 // transitive `heartbeatRuns` drizzle table access via successful-run-handoff-state).
 // It is loaded lazily at boot only when board alerting is actually enabled, so
@@ -1819,6 +1820,36 @@ export async function startServer(): Promise<StartedServer> {
     setInterval(() => {
       void runDatabaseBackupHealthBridge();
     }, backupHealthCheckIntervalMs);
+
+    // SIN-70820: anti-regression preflight for the SIN-70814 invariant — the
+    // embedded PostgreSQL major MUST match the host `postgresql-client` major, or
+    // pg_dump silently refuses to back up the server (the 9-day silent outage).
+    // Only meaningful in embedded mode, where the server major lives in
+    // <dataDir>/PG_VERSION. Resolve pg_dump the same way backup-lib does and
+    // compare majors; on divergence push a LOUD alert through the SIN-70819
+    // adapter (distinct fingerprint). Read-only + alert, never a boot hard-stop.
+    if (startupDbInfo.mode === "embedded-postgres") {
+      const pgClientVersionPreflight = createPgClientVersionPreflightReporter({
+        dataDir: startupDbInfo.dataDir,
+        pgDumpPath: process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump",
+        board: databaseBackupAlertBoard,
+        companyId: databaseBackupAlertCompanyId,
+        logger,
+      });
+      const runPgClientVersionPreflight = async () => {
+        try {
+          await pgClientVersionPreflight.run();
+        } catch (err) {
+          logger.error({ err }, "pg_dump client-major preflight tick failed");
+        }
+      };
+      // Run once at boot, then re-check on the same cadence as the health bridge
+      // so a later drift (or its fix) is picked up without a restart.
+      void runPgClientVersionPreflight();
+      setInterval(() => {
+        void runPgClientVersionPreflight();
+      }, backupHealthCheckIntervalMs);
+    }
   }
 
   // Wait for external adapters to finish loading before accepting requests.
